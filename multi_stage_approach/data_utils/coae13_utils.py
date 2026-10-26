@@ -42,7 +42,25 @@ class DataGenerator(object):
         data_dict['standard_char'] = shared_utils.get_char_col(sent_col, 1)
 
         # {bert_index: [char_index]}
-        mapping_col = cpc.bert_mapping_char(data_dict['bert_token'], data_dict['standard_char'])
+        from transformers import BertTokenizerFast
+        fast_tokenizer = BertTokenizerFast.from_pretrained(self.config.path.bert_model_path)
+        mapping_col = []
+        for sentence, tokens in zip(sent_col, data_dict['bert_token']):
+            encoded = fast_tokenizer(sentence, add_special_tokens=True, return_offsets_mapping=True)
+            fast_tokens = fast_tokenizer.convert_ids_to_tokens(encoded["input_ids"])
+            if fast_tokens != tokens:
+                raise ValueError(f"Slow/fast tokenizer mismatch: {sentence!r}")
+            mapping = {}
+            for bert_index, (start, end) in enumerate(encoded["offset_mapping"]):
+                for char_index in range(start, end):
+                    mapping[char_index] = bert_index
+            mapping[len(sentence)] = len(tokens) - 1
+            for char_index in range(len(sentence) - 1, -1, -1):
+                if char_index not in mapping:
+                    if not sentence[char_index].isspace():
+                        raise ValueError(f"Unmapped character {char_index} in {sentence!r}")
+                    mapping[char_index] = mapping[char_index + 1]
+            mapping_col.append(mapping)
 
         if self.config.model_mode == "norm":
 
@@ -166,7 +184,10 @@ class DataGenerator(object):
         key_col = ["input_ids", "attn_mask", "tuple_pair_col", "result_label", "multi_label", "comparative_label"]
 
         for key in key_col:
-            data_dict[key] = np.array(data_dict[key])
+            if key == "tuple_pair_col":
+                data_dict[key] = np.array(data_dict[key], dtype=object)
+            else:
+                data_dict[key] = np.array(data_dict[key])
             print(key, data_dict[key].shape)
 
         data_dict['comparative_label'] = np.array(data_dict['comparative_label']).reshape(-1, 1)
