@@ -1,0 +1,11 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Notebook state
+.ipynb_checkpoints/
+
+# COQE runtime artifacts
+multi_stage_approach/ModelResult/
+multi_stage_approach/PreTrainModel/
+multi_stage_approach/result.csv
