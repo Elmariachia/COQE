@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import torch
 from torch.utils.data import Dataset
@@ -66,3 +66,32 @@ class BertBatchCollator:
         )
         labels = torch.tensor([example.label for example in examples], dtype=torch.long)
         return encoded, labels, examples
+
+
+def build_char_vocab(examples: List[SentenceExample]) -> Dict[str, int]:
+    vocab = {"<pad>": 0, "<unk>": 1}
+    for example in examples:
+        for char in example.text:
+            if char not in vocab:
+                vocab[char] = len(vocab)
+    return vocab
+
+
+class LstmBatchCollator:
+    def __init__(self, vocab: Dict[str, int], max_length: int):
+        self.vocab = vocab
+        self.max_length = max_length
+
+    def __call__(self, examples: List[SentenceExample]):
+        sequences = []
+        for example in examples:
+            sequence = [self.vocab.get(char, 1) for char in example.text[: self.max_length]]
+            sequences.append(sequence or [1])
+
+        lengths = torch.tensor([len(sequence) for sequence in sequences], dtype=torch.long)
+        input_ids = torch.zeros((len(sequences), int(lengths.max())), dtype=torch.long)
+        for index, sequence in enumerate(sequences):
+            input_ids[index, : len(sequence)] = torch.tensor(sequence, dtype=torch.long)
+
+        labels = torch.tensor([example.label for example in examples], dtype=torch.long)
+        return {"input_ids": input_ids, "lengths": lengths}, labels, examples
