@@ -11,25 +11,36 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoTokenizer
 
-from tasks.csi.data import BertBatchCollator, SentenceDataset, read_coqe_split
+from tasks.csi.data import (
+    BertBatchCollator,
+    LstmBatchCollator,
+    SentenceDataset,
+    build_char_vocab,
+    read_coqe_split,
+)
 from tasks.csi.metrics import classification_metrics
-from tasks.csi.model import BertSentenceClassifier
+from tasks.csi.model import BertSentenceClassifier, LstmSentenceClassifier
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Standalone comparative sentence identification")
     parser.add_argument("--data_dir", required=True, help="Directory containing train.txt, dev.txt and test.txt")
-    parser.add_argument("--model_name_or_path", required=True, help="Hugging Face model id or local model directory")
+    parser.add_argument("--model_type", choices=("bert", "lstm"), default="bert")
+    parser.add_argument("--model_name_or_path", help="Required for BERT: Hugging Face model id or local directory")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--lstm_learning_rate", type=float, default=1e-4)
+    parser.add_argument("--lstm_classifier_learning_rate", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--embedding_dim", type=int, default=300)
+    parser.add_argument("--hidden_size", type=int, default=512)
+    parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=2021)
     parser.add_argument("--selection_metric", choices=("accuracy", "f1", "macro_f1"), default="accuracy")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -56,13 +67,13 @@ def resolve_device(requested: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def make_loader(examples, tokenizer, batch_size: int, max_length: int, shuffle: bool, num_workers: int):
+def make_loader(examples, collator, batch_size: int, shuffle: bool, num_workers: int):
     return DataLoader(
         SentenceDataset(examples),
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        collate_fn=BertBatchCollator(tokenizer, max_length),
+        collate_fn=collator,
         pin_memory=torch.cuda.is_available(),
     )
 
@@ -137,6 +148,8 @@ def save_predictions(path: Path, rows: List[Dict[str, object]]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.model_type == "bert" and not args.model_name_or_path:
+        raise ValueError("--model_name_or_path is required when --model_type bert")
     set_seed(args.seed)
     device = resolve_device(args.device)
     output_dir = Path(args.output_dir)
@@ -150,21 +163,52 @@ def main() -> None:
     print({name: len(examples) for name, examples in splits.items()})
     print(f"device={device}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+    tokenizer = None
+    vocab = None
+    if args.model_type == "bert":
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+        collator = BertBatchCollator(tokenizer, args.max_length)
+    else:
+        vocab = build_char_vocab(splits["train"])
+        collator = LstmBatchCollator(vocab, args.max_length)
+        print(f"vocab_size={len(vocab)}")
+
     loaders = {
         "train": make_loader(
-            splits["train"], tokenizer, args.batch_size, args.max_length, True, args.num_workers
+            splits["train"], collator, args.batch_size, True, args.num_workers
         ),
         "dev": make_loader(
-            splits["dev"], tokenizer, args.batch_size, args.max_length, False, args.num_workers
+            splits["dev"], collator, args.batch_size, False, args.num_workers
         ),
         "test": make_loader(
-            splits["test"], tokenizer, args.batch_size, args.max_length, False, args.num_workers
+            splits["test"], collator, args.batch_size, False, args.num_workers
         ),
     }
 
-    model = BertSentenceClassifier(args.model_name_or_path, dropout=args.dropout).to(device)
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    if args.model_type == "bert":
+        model = BertSentenceClassifier(args.model_name_or_path, dropout=args.dropout).to(device)
+        optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    else:
+        model = LstmSentenceClassifier(
+            vocab_size=len(vocab),
+            embedding_dim=args.embedding_dim,
+            hidden_size=args.hidden_size,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+        ).to(device)
+        optimizer = AdamW(
+            [
+                {
+                    "params": list(model.embedding.parameters()) + list(model.encoder.parameters()),
+                    "lr": args.lstm_learning_rate,
+                },
+                {"params": model.classifier.parameters(), "lr": args.lstm_classifier_learning_rate},
+            ],
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.99),
+        )
 
     best_score = float("-inf")
     best_path = output_dir / "best_model.pt"
@@ -184,6 +228,8 @@ def main() -> None:
                     "model_state_dict": model.state_dict(),
                     "model_name_or_path": args.model_name_or_path,
                     "dropout": args.dropout,
+                    "model_type": args.model_type,
+                    "vocab": vocab,
                     "selection_metric": args.selection_metric,
                     "score": score,
                     "epoch": epoch,
@@ -196,7 +242,8 @@ def main() -> None:
     dev_metrics, dev_rows = evaluate(model, loaders["dev"], device)
     test_metrics, test_rows = evaluate(model, loaders["test"], device)
 
-    tokenizer.save_pretrained(output_dir / "tokenizer")
+    if tokenizer is not None:
+        tokenizer.save_pretrained(output_dir / "tokenizer")
     save_json(output_dir / "history.json", {"epochs": history})
     save_json(output_dir / "dev_metrics.json", dev_metrics)
     save_json(output_dir / "test_metrics.json", test_metrics)
